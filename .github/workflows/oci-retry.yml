@@ -31,6 +31,12 @@ jobs:
       - name: Write shape config
         run: echo '{"ocpus":2,"memoryInGBs":12}' > /tmp/shape-config.json
 
+      - name: Notify Discord on start
+        run: |
+          curl -H "Content-Type: application/json" \
+            -d "{\"content\": \"🔄 **OCI retry script started** — will attempt every 3 minutes for up to 5.5 hours.\"}" \
+            ${{ secrets.DISCORD_WEBHOOK }}
+
       - name: Retry loop
         id: create
         run: |
@@ -68,7 +74,7 @@ jobs:
             sleep 180
           done
 
-      - name: Send Discord notification
+      - name: Send Discord notification on success
         if: steps.create.outputs.CREATED == 'true'
         run: |
           curl -H "Content-Type: application/json" \
