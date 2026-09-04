@@ -8,7 +8,7 @@ on:
 jobs:
   retry:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 360
 
     steps:
       - name: Install OCI CLI
@@ -33,27 +33,36 @@ jobs:
 
       - name: Notify Discord on start
         run: |
-          curl -H "Content-Type: application/json" \
+          curl -s -H "Content-Type: application/json" \
             -d "{\"content\": \"🔄 **OCI retry script started** — will attempt every 3 minutes for up to 5.5 hours.\"}" \
             ${{ secrets.DISCORD_WEBHOOK }}
 
       - name: Retry loop
         id: create
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          REPO: ${{ github.repository }}
+          TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+          SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
         run: |
           attempt=0
-          while true; do
+          # Stop looping after 315 minutes (5h15m) to chain before GitHub's 6h hard kill
+          end_time=$(( $(date +%s) + 315 * 60 ))
+
+          while [ $(date +%s) -lt $end_time ]; do
             attempt=$((attempt + 1))
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] Attempt #$attempt"
 
             result=$(oci compute instance launch \
-              --compartment-id ${{ secrets.OCI_TENANCY_OCID }} \
+              --compartment-id "$TENANCY_OCID" \
               --availability-domain SxLr:AP-SYDNEY-1-AD-1 \
               --shape VM.Standard.A1.Flex \
               --shape-config file:///tmp/shape-config.json \
               --image-id ocid1.image.oc1.ap-sydney-1.aaaaaaaaqwjndgjfljuqksessepinj5xuzyhqknwemkcmqxvsmrkvnrcxsha \
               --subnet-id ocid1.subnet.oc1.ap-sydney-1.aaaaaaaaioisjs24rloqu7dnknd2hi5wycwlaz3cyl726637qfxmbmcybtda \
               --display-name hermes-server \
-              --ssh-authorized-keys-file <(echo "${{ secrets.SSH_PUBLIC_KEY }}") \
+              --ssh-authorized-keys-file <(echo "$SSH_PUBLIC_KEY") \
               --assign-public-ip false \
               --boot-volume-size-in-gbs 50 \
               --raw-output 2>&1) || true
@@ -63,6 +72,12 @@ jobs:
               echo "INSTANCE_ID=$instance_id" >> $GITHUB_OUTPUT
               echo "CREATED=true" >> $GITHUB_OUTPUT
               echo "SUCCESS: Instance created: $instance_id"
+
+              curl -s -H "Content-Type: application/json" \
+                -d "{\"content\": \"✅ **Oracle A1 instance created!**\n\n**Instance OCID:** \`$instance_id\`\n\nGo to Oracle Console, assign a public IP, then SSH in.\"}" \
+                "$DISCORD_WEBHOOK"
+
+              gh workflow disable oci-retry.yml
               exit 0
             elif echo "$result" | grep -q "Out of host capacity\|Out of capacity"; then
               echo "  No capacity. Waiting 3 minutes..."
@@ -74,26 +89,10 @@ jobs:
             sleep 180
           done
 
-      - name: Send Discord notification on success
-        if: steps.create.outputs.CREATED == 'true'
-        run: |
-          curl -H "Content-Type: application/json" \
-            -d "{\"content\": \"✅ **Oracle A1 instance created!**\n\n**Instance OCID:** \`${{ steps.create.outputs.INSTANCE_ID }}\`\n\nGo to Oracle Console, assign a public IP, then SSH in.\"}" \
-            ${{ secrets.DISCORD_WEBHOOK }}
-
-      - name: Disable workflow on success
-        if: steps.create.outputs.CREATED == 'true'
-        run: gh workflow disable oci-retry.yml
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Chain next run if not created
-        if: steps.create.outputs.CREATED != 'true'
-        run: |
-          echo "Timed out. Waiting 5 minutes then spawning next run..."
-          sleep 300
-          curl -X POST \
-            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+          # Time's up — chain the next run
+          echo "5h15m elapsed. Chaining next run..."
+          curl -s -X POST \
+            -H "Authorization: token $GITHUB_TOKEN" \
             -H "Accept: application/vnd.github.v3+json" \
-            https://api.github.com/repos/${{ github.repository }}/dispatches \
+            https://api.github.com/repos/$REPO/dispatches \
             -d '{"event_type": "restart-hunt"}'
