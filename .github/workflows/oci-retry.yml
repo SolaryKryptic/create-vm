@@ -1,0 +1,73 @@
+name: OCI A1 Instance Retry
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'  # every 5 minutes
+  workflow_dispatch:        # allow manual trigger
+
+jobs:
+  retry:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install OCI CLI
+        run: pip install oci-cli --quiet
+
+      - name: Configure OCI CLI
+        run: |
+          mkdir -p ~/.oci
+          echo "${{ secrets.OCI_PRIVATE_KEY }}" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+          cat > ~/.oci/config << OCICONFIG
+          [DEFAULT]
+          user=${{ secrets.OCI_USER_OCID }}
+          fingerprint=${{ secrets.OCI_FINGERPRINT }}
+          tenancy=${{ secrets.OCI_TENANCY_OCID }}
+          region=ap-sydney-1
+          key_file=/home/runner/.oci/oci_api_key.pem
+          OCICONFIG
+
+      - name: Write shape config
+        run: echo '{"ocpus":2,"memoryInGBs":12}' > /tmp/shape-config.json
+
+      - name: Attempt instance creation
+        id: create
+        run: |
+          result=$(oci compute instance launch \
+            --compartment-id ${{ secrets.OCI_TENANCY_OCID }} \
+            --availability-domain SxLr:AP-SYDNEY-1-AD-1 \
+            --shape VM.Standard.A1.Flex \
+            --shape-config file:///tmp/shape-config.json \
+            --image-id ocid1.image.oc1.ap-sydney-1.aaaaaaaaqwjndgjfljuqksessepinj5xuzyhqknwemkcmqxvsmrkvnrcxsha \
+            --subnet-id ocid1.subnet.oc1.ap-sydney-1.aaaaaaaaioisjs24rloqu7dnknd2hi5wycwlaz3cyl726637qfxmbmcybtda \
+            --display-name hermes-server \
+            --ssh-authorized-keys-file <(echo "${{ secrets.SSH_PUBLIC_KEY }}") \
+            --assign-public-ip false \
+            --boot-volume-size-in-gbs 50 \
+            --raw-output 2>&1) || true
+
+          if echo "$result" | grep -q '"lifecycle-state"'; then
+            echo "CREATED=true" >> $GITHUB_OUTPUT
+            instance_id=$(echo "$result" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['id'])")
+            echo "INSTANCE_ID=$instance_id" >> $GITHUB_OUTPUT
+            echo "Instance created successfully: $instance_id"
+          elif echo "$result" | grep -q "Out of host capacity\|Out of capacity"; then
+            echo "CREATED=false" >> $GITHUB_OUTPUT
+            echo "No capacity available."
+          else
+            echo "CREATED=false" >> $GITHUB_OUTPUT
+            echo "Unexpected response: $result"
+          fi
+
+      - name: Send Discord notification
+        if: steps.create.outputs.CREATED == 'true'
+        run: |
+          curl -H "Content-Type: application/json" \
+            -d "{\"content\": \"✅ **Oracle A1 instance created!**\n\n**Instance OCID:** \`${{ steps.create.outputs.INSTANCE_ID }}\`\n\nGo to Oracle Console, assign a public IP, then SSH in.\"}" \
+            ${{ secrets.DISCORD_WEBHOOK }}
+
+      - name: Disable workflow on success
+        if: steps.create.outputs.CREATED == 'true'
+        run: gh workflow disable oci-retry.yml
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
